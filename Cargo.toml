@@ -1,0 +1,20 @@
+[package]
+name = "ls_service"
+version = "0.1.0"
+authors = ["Jacob Smith <jacob101607@yahoo.com>"]
+
+license = "MIT"
+description = """
+Implementation of an asynchronous service for creating Language Servers on top of Tokio and Futures-rs
+"""
+
+homepage   = "https://github.com/smith61/ls_service"
+repository = "https://github.com/smith61/ls_service"
+readme     = "README.md"
+
+[dependencies]
+futures = "0.1"
+log = "0.3"
+lsp_rs = { git = "https://github.com/smith61/rls_proto" }
+tokio-core = "0.1"
+tokio-stdio = { git = "https://github.com/smith61/tokio-stdio" }
