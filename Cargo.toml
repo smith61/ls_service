@@ -1,6 +1,6 @@
 [package]
 name = "ls_service"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Jacob Smith <jacob101607@yahoo.com>"]
 
 license = "MIT"

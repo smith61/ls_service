@@ -23,11 +23,11 @@ extern crate ls_service;
 extern crate tokio_core;
 extern crate tokio_stdio;
 
-use lsp_rs::server::{
+use lsp_rs::{
     INVALID_REQUEST,
-    NotificationMessage,
-    RequestMessage,
-    RequestResponseError
+    ServerNotification,
+    ServerRequest,
+    ResponseError
 };
 use ls_service::{
     service
@@ -43,14 +43,14 @@ struct MessageHandler;
 
 impl service::MessageHandler for MessageHandler {
 
-    fn handle_request( &self, _ : service::ServiceHandle, _ : RequestMessage, output : service::ResponseOutput ) {
-        output.send_error( RequestResponseError {
+    fn handle_request( &self, _ : service::ServiceHandle, _ : ServerRequest, output : service::ResponseOutput ) {
+        output.send_error( ResponseError {
             code    : INVALID_REQUEST,
             message : "Bad request".to_string( )
         } );
     }
 
-    fn handle_notification( &self, _ : service::ServiceHandle, _ : NotificationMessage ) { }
+    fn handle_notification( &self, _ : service::ServiceHandle, _ : ServerNotification ) { }
 
 }
 
