@@ -18,18 +18,21 @@ use futures::sync::{
     mpsc,
     oneshot
 };
-use lsp_rs::server::{
-    ClientMessage,
-    ClientNotificationMessage,
+use lsp_rs::{
+    ClientNotification,
+    IncomingMessage,
     IncomingServerMessage,
+    MessageEnvelope,
     NotificationMessage,
+    OutgoingMessage,
     OutgoingServerMessage,
+    ResponseError,
+    ResponseMessage,
     RequestMessage,
-    RequestResponseData,
-    RequestResponseError,
-    RequestResponseMessage,
-    RLSCodec,
-    ServerMessage
+    ServerCodec,
+    ServerNotification,
+    ServerResponse,
+    ServerRequest
 };
 use std::{
     io
@@ -52,14 +55,14 @@ use tokio_core::reactor::{
     Remote
 };
 
-type IoRead< I : Io >    = SplitStream< Framed< I, RLSCodec > >;
-type IoWrite< I : Io >   = SplitSink< Framed< I, RLSCodec > >;
+type IoRead< I : Io >    = SplitStream< Framed< I, ServerCodec > >;
+type IoWrite< I : Io >   = SplitSink< Framed< I, ServerCodec > >;
 
 type CommandQueueSend    = mpsc::Sender< ServiceCommand >;
 type CommandQueueRead    = mpsc::Receiver< ServiceCommand >;
 
-type ResponseChannelSend = oneshot::Sender< RequestResponseMessage >;
-type ResponseChannelRead = oneshot::Receiver< RequestResponseMessage >;
+type ResponseChannelSend = oneshot::Sender< ResponseMessage< ServerResponse > >;
+type ResponseChannelRead = oneshot::Receiver< ResponseMessage< ServerResponse > >;
 
 type ResponseQueueSend   = mpsc::Sender< ResponseChannelRead >;
 type ResponseQueueRead   = mpsc::Receiver< ResponseChannelRead >;
@@ -87,13 +90,13 @@ pub trait MessageHandler {
     /// This method does not have to respond before returning and can complete the request asynchronously,
     /// responses will be properly ordered when they are completed. This method should not block as it
     /// will block the IO thread and prevent other messages from being processed.
-    fn handle_request( &self, service : ServiceHandle, request : RequestMessage, output : ResponseOutput );
+    fn handle_request( &self, service : ServiceHandle, request : ServerRequest, output : ResponseOutput );
 
     /// Trait method called when a new NotificationMessage has been received from the client.
     ///
     /// This method should not block as it will block the IO thread and prevent other messages from being
     /// processed.
-    fn handle_notification( &self, service : ServiceHandle, notification : NotificationMessage );
+    fn handle_notification( &self, service : ServiceHandle, notification : ServerNotification );
 
 }
 
@@ -144,7 +147,7 @@ struct Service {
 }
 
 enum ServiceCommand {
-    SendNotification( ClientNotificationMessage ),
+    SendNotification( ClientNotification ),
     Shutdown
 }
 
@@ -211,27 +214,27 @@ impl Future for ShutdownFuture {
 
 impl ResponseOutput {
 
-    pub fn send_result( self, result : RequestResponseData ) {
+    pub fn send_result( self, result : ServerResponse ) {
         let request_id = self.request_id;
 
-        self.complete( RequestResponseMessage {
+        self.complete( ResponseMessage {
             id     : request_id,
             result : Some( result ),
             error  : None
         } );
     }
 
-    pub fn send_error( self, error : RequestResponseError ) {
+    pub fn send_error( self, error : ResponseError ) {
         let request_id = self.request_id;
 
-        self.complete( RequestResponseMessage {
+        self.complete( ResponseMessage {
             id     : request_id,
             result : None,
             error  : Some( error )
         } );
     }
 
-    fn complete( self, response : RequestResponseMessage ) {
+    fn complete( self, response : ResponseMessage< ServerResponse > ) {
         let ResponseOutput { request_id , result_channel } = self;
         trace!( "Completing request {} with response {:?}", request_id, response );
 
@@ -255,7 +258,7 @@ impl ServiceHandle {
         } );
     }
 
-    pub fn send_notification( &self, notification : ClientNotificationMessage ) {
+    pub fn send_notification( &self, notification : ClientNotification ) {
         let moved_command_send = self.command_send.clone( );
         self.remote_handle.spawn( move | _ | {
             moved_command_send.send( ServiceCommand::SendNotification( notification ) ).then( | _ | {
@@ -274,7 +277,7 @@ impl Service {
         let ( shutdown_send, shutdown_read ) = oneshot::channel( );
         let ( command_send, command_read ) = mpsc::channel( 16 );
 
-        let ( io_write, io_read ) = io.framed( RLSCodec::new( ) ).split( );
+        let ( io_write, io_read ) = io.framed( ServerCodec::new( ) ).split( );
 
         let shutdown_future = ShutdownFuture {
             shared_future : shutdown_read.shared( )
@@ -310,9 +313,15 @@ impl Service {
     }
 
     fn spawn_message_writer< I : Io + 'static >( this : Rc< Self >, write_queue_read : WriteQueueRead, io_write : IoWrite< I > ) {
-        let writer = io_write.send_all( write_queue_read.map_err( | _ | {
+        let write_queue_read_map = write_queue_read.map( | message | {
+            MessageEnvelope {
+                headers : HashMap::new( ),
+                message : message
+            }
+        } ).map_err( | _ | {
             io::Error::new( io::ErrorKind::Other, "Error reading from write queue." )
-        } ) ).map( | _ | {
+        } );
+        let writer = io_write.send_all( write_queue_read_map ).map( | _ | {
             ( )
         } ).map_err( | err | {
             ServiceError::WriteError( Rc::new( err ) )
@@ -401,7 +410,7 @@ impl < H : MessageHandler + 'static, I : Io + 'static > MessageReader< H, I > {
 
     fn next_message( &mut self ) -> Poll< IncomingServerMessage, ServiceError > {
         match self.io_read.poll( ) {
-            Ok( Async::Ready( Some( val ) ) ) => Ok( Async::Ready( val ) ),
+            Ok( Async::Ready( Some( val ) ) ) => Ok( Async::Ready( val.message ) ),
             Ok( Async::Ready( None ) ) => {
                 error!( "Incoming stream out of messages." );
 
@@ -442,23 +451,28 @@ impl < H : MessageHandler + 'static, I : Io + 'static > Future for MessageReader
             }
 
             let message = try_poll!( self.next_message( ) );
-            match message.message {
-                ServerMessage::Request( request ) => {
+            match message {
+                IncomingMessage::Request( request ) => {
                     trace!( "Received request message: {:?}", request );
+
+                    let RequestMessage{ id, method } = request;
 
                     let ( response_send, response_read ) = oneshot::channel( );
                     let output = ResponseOutput {
-                        request_id     : request.id,
+                        request_id     : id,
                         result_channel : response_send
                     };
 
-                    self.message_handler.handle_request( self.service_handle.clone( ), request, output );
+                    self.message_handler.handle_request( self.service_handle.clone( ), method, output );
                     self.current_request = Some( response_read );
                 },
-                ServerMessage::Notification( notification ) => {
+                IncomingMessage::Notification( notification ) => {
                     trace!( "Received notification message: {:?}", notification );
 
-                    self.message_handler.handle_notification( self.service_handle.clone( ), notification );
+                    self.message_handler.handle_notification( self.service_handle.clone( ), notification.method );
+                },
+                IncomingMessage::Response( response ) => {
+                    unimplemented!( );
                 }
             }
         }
@@ -507,10 +521,7 @@ impl ResponseWriter {
             Err( _ ) => return Ok( Async::Ready( ( ) ) )
         };
 
-        self.response = Some( OutgoingServerMessage {
-            headers : HashMap::new( ),
-            message : ClientMessage::Response( response )
-        } );
+        self.response = Some( OutgoingMessage::Response( response ) );
         Ok( Async::Ready( ( ) ) )
     }
 
@@ -611,10 +622,7 @@ impl Future for CommandHandler {
                     return Ok( Async::NotReady );
                 },
                 ServiceCommand::SendNotification( notification ) => {
-                    self.current_notification = Some( OutgoingServerMessage {
-                        headers : HashMap::new( ),
-                        message : ClientMessage::Notification( notification )
-                    } );
+                    self.current_notification = Some( OutgoingMessage::Notification( NotificationMessage { method : notification } ) );
                 }
             }
         }
